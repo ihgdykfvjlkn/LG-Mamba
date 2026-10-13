@@ -1,5 +1,4 @@
-# 这是我的iqaScrach.py
-#!/usr/bin/env python3
+# 这是我的主程序
 import argparse
 import csv
 import datetime
@@ -26,15 +25,7 @@ import torch.nn.functional as F
 from dataset import IQADataset, SCIDDataset, SIQADDataset
 from demomodel import DFSSMambaNet, IQANet
 from scipy.stats import pearsonr, spearmanr
-from src.utils import (
-    PLCC,
-    RMSE,
-    SROCC,
-    AverageMeter,
-    MMD_loss,
-    load_checkpoint_file,
-    strict_load_checkpoint,
-)
+from src.utils import PLCC, RMSE, SROCC, AverageMeter, MMD_loss
 from tqdm import tqdm
 
 # ========================================
@@ -53,9 +44,7 @@ os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# ========================================
-# 👑 硬性确立全局确定性，保障论文复现性
-# ========================================
+
 def seed_everything(seed=42):
   random.seed(seed)
   np.random.seed(seed)
@@ -118,13 +107,7 @@ def gaussian_batch(custom_feat):
 
 
 def validate(
-    val_loader,
-    model,
-    criterion,
-    show_step=False,
-    dataset_name='SIQAD',
-    prediction_csv_path=None,
-    split=None,
+    val_loader, model, criterion, show_step=False, dataset_name='SIQAD'
 ):
   losses = AverageMeter()
   srocc = SROCC()
@@ -156,10 +139,6 @@ def validate(
 
   dist_names = dataset_mapping.get(dataset_name, {})
   dist_scores = {}
-  prediction_rows = []
-  next_sample_index = 0
-  raw_model = model.module if hasattr(model, 'module') else model
-  inference_only = not raw_model.istrain
 
   logger.info('Validation...')
   model.eval()
@@ -175,13 +154,12 @@ def validate(
   with torch.no_grad():
     for i, (img, ref, pref, score, dtype) in pbar:
       img = img.cuda(non_blocking=True)
+      ref = ref.cuda(non_blocking=True)
+      pref = pref.cuda(non_blocking=True)
       score = score.cuda(non_blocking=True)
-      if inference_only:
-        output = model(img)
-      else:
-        ref = ref.cuda(non_blocking=True)
-        pref = pref.cuda(non_blocking=True)
-        output, _, _, _, _, _, _, _, _ = model(img, ref, pref)
+      dtype = dtype.cuda(non_blocking=True)
+
+      output, _, _, _, _, _, _, _, _ = model(img, ref, pref)
       loss = criterion(output.squeeze(), score.squeeze())
 
       losses.update(loss.item(), img.size(0))
@@ -189,25 +167,14 @@ def validate(
       pred = output.detach().cpu().numpy().reshape(-1)
       gt = score.detach().cpu().numpy().reshape(-1)
       dtype_np = dtype.cpu().numpy().reshape(-1)
-      batch_indices = np.arange(
-          next_sample_index, next_sample_index + gt.size, dtype=np.int64
-      )
-      next_sample_index += gt.size
 
       valid = np.isfinite(pred) & np.isfinite(gt)
-      prediction_rows.extend(
-          (int(index), int(d), float(g), float(p), bool(is_valid))
-          for index, d, g, p, is_valid in zip(
-              batch_indices, dtype_np, gt, pred, valid
-          )
-      )
       if valid.sum() == 0:
         continue
 
       pred = pred[valid]
       gt = gt[valid]
       dtype_np = dtype_np[valid]
-      batch_indices = batch_indices[valid]
 
       srocc.update(gt, pred)
       plcc.update(gt, pred)
@@ -223,57 +190,19 @@ def validate(
 
   final_srocc = float(srocc.compute())
   final_plcc = float(plcc.compute())
-  # Reuse the exact PLCC mapping so prediction CSV reproduces both PLCC/RMSE.
-  final_rmse = float(
-      np.sqrt(np.mean((plcc.last_mos - plcc.last_mapped_prediction) ** 2))
-  ) if plcc.last_mos.size >= 2 else float('nan')
+  final_rmse = float(rmse.compute())
 
   logger.info('\n📊 Validation Complete!')
-  logger.info(f'   SROCC (raw prediction): {final_srocc:.6f}')
-  logger.info(f'   PLCC (5-parameter logistic mapped): {final_plcc:.6f}')
-  logger.info(f'   RMSE (5-parameter logistic mapped): {final_rmse:.6f}')
-
-  if prediction_csv_path is not None:
-    mapped_by_index = {
-        row[0]: float(mapped)
-        for row, mapped in zip(
-            [row for row in prediction_rows if row[4]],
-            plcc.last_mapped_prediction,
-        )
-    }
-    with open(prediction_csv_path, mode='w', newline='', encoding='utf-8') as f:
-      writer = csv.writer(f)
-      writer.writerow([
-          'split',
-          'sample_index',
-          'image_path_or_id',
-          'dtype',
-          'gt',
-          'raw_prediction',
-          'mapped_prediction',
-      ])
-      for sample_index, d, g, p, is_valid in prediction_rows:
-        image_id = str(sample_index)
-        if hasattr(val_loader.dataset, 'img_list'):
-          image_id = val_loader.dataset.img_list[sample_index]
-        writer.writerow([
-            split,
-            sample_index,
-            image_id,
-            d,
-            f'{g:.10g}',
-            f'{p:.10g}',
-            f"{mapped_by_index.get(sample_index, float('nan')):.10g}",
-        ])
-    logger.info(f'✅ Prediction details saved to: {prediction_csv_path}')
+  logger.info(f'   SROCC: {final_srocc:.6f}')
+  logger.info(f'   PLCC : {final_plcc:.6f}')
+  logger.info(f'   RMSE : {final_rmse:.6f}')
 
   logger.info('\n' + '=' * 60)
   logger.info(
-      '📊 RAW PER-DISTORTION DIAGNOSTIC METRICS '
-      f'({dataset_name}; no logistic fitting)'
+      f'📊 PERFORMANCE ON INDIVIDUAL DISTORTION TYPES ({dataset_name})'
   )
   logger.info('=' * 60)
-  logger.info(f"{'Type':<15}{'raw SROCC':<12}{'raw PLCC':<12}{'Samples'}")
+  logger.info(f"{'Type':<15}{'SROCC':<12}{'PLCC':<12}{'Samples'}")
   logger.info('-' * 60)
 
   for d in sorted(dist_scores.keys()):
@@ -414,13 +343,9 @@ def train(train_loader, model, criterion, optimizer, epoch, scaler=None):
   return losses1.avg
 
 
-# ============================================================
-# 🎯 核心逻辑适配：冻结策略与三段式差分优化器
-# ============================================================
-
 
 def apply_stage1_freezing(net):
-  """Stage 1: 冻结整个 MobileNet 骨干网络（CNN），只训练 Mamba、Attention 及 Head."""
+  """Stage 1: 冻结整个 MobileNet 骨干网络（CNN），只训练 Mamba、Attention 及 Head。"""
   logger.info(
       '🔒 [Stage 1] 锁定 MobileNet 全部参数，释放 Mamba/Attention/Head...'
   )
@@ -432,7 +357,7 @@ def apply_stage1_freezing(net):
 
 
 def apply_stage2_freezing(net):
-  """Stage 2: 精准解冻。冻结 MobileNet 浅层 (features 0-5)，解冻 features 6+ 及后续模块."""
+  """Stage 2: 精准解冻。冻结 MobileNet 浅层 (features 0-5)，解冻 features 6+ 及后续模块。"""
   logger.info(
       '🔓 [Stage 2] 正在应用精细化解冻 (浅层 features[0:5] 保持冻结)...'
   )
@@ -453,7 +378,7 @@ def apply_stage2_freezing(net):
 
 
 def build_stage2_optimizer(net, weight_decay_val):
-  """构建 Stage 2 精细化三段式差分 LR 优化器."""
+  """构建 Stage 2 精细化三段式差分 LR 优化器。"""
   mobilenet_params = []
   mamba_params = []
   head_params = []
@@ -477,7 +402,7 @@ def build_stage2_optimizer(net, weight_decay_val):
       {'params': head_params, 'lr': 1e-5, 'name': 'Regression_Head'},
   ]
 
-  logger.info('⚙️  [Stage 2 优化器构建完成] 参数组分布与学习率设置:')
+  logger.info('[Stage 2 优化器构建完成] 参数组分布与学习率设置:')
   logger.info(
       f'   🔹 MobileNet (后几层解冻): {len(mobilenet_params)} 个张量 -> LR = 1e-6'
   )
@@ -491,16 +416,6 @@ def build_stage2_optimizer(net, weight_decay_val):
   return torch.optim.Adam(
       param_groups, betas=(0.9, 0.999), weight_decay=weight_decay_val
   )
-
-
-def build_model(args, istrain):
-  if args.use_dfss_mamba:
-    return DFSSMambaNet(
-        istrain=istrain,
-        n_class=args.n_dtype,
-        mamba_img_size=args.mamba_img_size,
-    )
-  return IQANet(istrain=istrain, n_class=args.n_dtype)
 
 
 def train_iqa(args):
@@ -524,8 +439,12 @@ def train_iqa(args):
   torch.cuda.empty_cache()
 
   if use_dfss_mamba:
-    print('🔥 Using DFSSMambaNet (Scratch Training)')
-  model = build_model(args, istrain=True)
+    print(' Using DFSSMambaNet (Scratch Training)')
+    model = DFSSMambaNet(
+        istrain=True, n_class=dtypes, mamba_img_size=mamba_img_size
+    )
+  else:
+    model = IQANet(istrain=True, n_class=dtypes)
 
   model = model.cuda()
   model = nn.DataParallel(model)
@@ -546,7 +465,20 @@ def train_iqa(args):
       n_class=dtypes,
   )
 
-  test_phase_name = f'test_{pro}'
+
+  val_phase_name = f'test_{pro}'
+  check_val_path = os.path.join(list_dir, f'{val_phase_name}_data.json')
+  if not os.path.exists(check_val_path):
+    val_phase_name = f'val_{pro}'
+
+  val_dataset = actual_dataset_class(
+      data_dir,
+      val_phase_name,
+      list_dir=list_dir,
+      patch_size=patch_size,
+      n_ptchs=n_ptchs,
+      n_class=dtypes,
+  )
 
   train_loader = torch.utils.data.DataLoader(
       train_dataset,
@@ -558,35 +490,9 @@ def train_iqa(args):
       prefetch_factor=4 if num_workers > 0 else None,
       drop_last=True,
   )
-  test_dataset = None
-  test_loader = None
-
-  def build_test_loader():
-    nonlocal test_dataset, test_loader
-    if test_loader is not None:
-      return test_loader
-    test_json_path = os.path.join(list_dir, f'{test_phase_name}_data.json')
-    if not os.path.exists(test_json_path):
-      raise FileNotFoundError(f'Test split not found: {test_json_path}')
-    test_dataset = actual_dataset_class(
-        data_dir,
-        test_phase_name,
-        list_dir=list_dir,
-        patch_size=patch_size,
-        n_ptchs=n_ptchs,
-        n_class=dtypes,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
-    return test_loader
-
-  if args.eval_every_epoch or args.evaluate:
-    build_test_loader()
+  val_loader = torch.utils.data.DataLoader(
+      val_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True
+  )
 
   logger.info('\n' + '🔥 ' * 25)
   logger.info('⚙️  EXPERIMENTAL CONFIGURATION SECURE CHECK (SCRATCH)')
@@ -596,19 +502,10 @@ def train_iqa(args):
       f'   📊 Train Dataset Size:  {len(train_dataset)} samples (Total'
       f' Batches: {len(train_loader)})'
   )
-  if args.eval_every_epoch:
-    logger.warning(
-        'DIAGNOSTIC ONLY — test metrics are not used for model selection.'
-    )
-    logger.info(
-        f'   🧪 Test Dataset Size:   {len(test_dataset)} samples (Phase: '
-        f'{test_phase_name}; diagnostic evaluation after every epoch)'
-    )
-  else:
-    logger.info(
-        f'   🧪 Formal evaluation:   {test_phase_name} is not loaded/evaluated '
-        'during training; it will be evaluated once after final checkpoint reload.'
-    )
+  logger.info(
+      f'   🧪 Val Dataset Size:    {len(val_dataset)} samples (Phase:'
+      f' {val_phase_name})'
+  )
   logger.info(f'   📦 Runtime Batch Size:  {batch_size}')
   logger.info(f'   🧩 Stage 1 Epochs:     {stage1_epochs}')
   logger.info('=' * 50 + '\n')
@@ -618,6 +515,9 @@ def train_iqa(args):
   best_plcc = -1.0
   best_rmse = 99.0
   checkpoint = None
+
+  patience = 40
+  no_improve = 0
 
   raw_model = model.module if hasattr(model, 'module') else model
 
@@ -629,35 +529,42 @@ def train_iqa(args):
       weight_decay=args.weight_decay,
   )
 
-  # ----------------------------------------------------
-  # 断点接力支持（兼容新 split_X 目录结构）
-  # ----------------------------------------------------
-  if resume and not args.anew:
-    resume_file = None
-    base_models_dir = args.model_root
 
-    new_dir_ckpt = os.path.join(
-        base_models_dir,
-        args.dataset.lower(),
-        f'split_{pro}',
-        'checkpoint_latest.pkl',
-    )
-    old_file_ckpt = (
-        resume.replace('.pkl', f'_{pro}.pkl')
-        if f'_{pro}.pkl' not in resume
-        else resume
-    )
+  base_models_dir = (
+      '/mnt/h/25liuyx/projects/DFSS-IQA-main/DFSS_Release/models'
+  )
+  default_split_dir = os.path.join(
+      base_models_dir, args.dataset.lower(), f'split_{pro}'
+  )
+  default_split_ckpt = os.path.join(
+      default_split_dir, 'checkpoint_latest.pkl'
+  )
 
-    if os.path.exists(new_dir_ckpt):
-      resume_file = new_dir_ckpt
-    elif os.path.exists(old_file_ckpt):
-      resume_file = old_file_ckpt
-    elif os.path.exists(resume):
-      resume_file = resume
+  resume_file = None
+  if not args.anew:
+    if resume:
+      resume_file = os.path.abspath(os.path.expanduser(resume))
+      if not os.path.isfile(resume_file):
+        raise FileNotFoundError(
+            f'--resume 指定的权重文件不存在: {resume_file}'
+        )
+    elif os.path.isfile(default_split_ckpt):
+      resume_file = default_split_ckpt
 
-    if resume_file and os.path.isfile(resume_file):
-      logger.info(f"📂 [断点接力] 正在为您加载历史权重: '{resume_file}'")
-      checkpoint = load_checkpoint_file(resume_file, map_location='cuda')
+  if args.save_dir:
+    run_save_dir = os.path.abspath(os.path.expanduser(args.save_dir))
+  elif resume_file is not None and resume:
+    run_save_dir = os.path.dirname(resume_file)
+  else:
+    run_save_dir = default_split_dir
+
+  os.makedirs(run_save_dir, exist_ok=True)
+  logger.info(f'本次运行的权重保存目录: {run_save_dir}')
+
+  if resume_file is not None:
+    if os.path.isfile(resume_file):
+      logger.info(f"正在为您加载历史权重: '{resume_file}'")
+      checkpoint = torch.load(resume_file, map_location='cuda')
 
       if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
@@ -672,12 +579,20 @@ def train_iqa(args):
         state_dict = checkpoint
         start_epoch = 0
 
-      load_report = strict_load_checkpoint(model, checkpoint, resume_file)
-      logger.info(
-          '   Strict checkpoint check: missing_keys=0, unexpected_keys=0, '
-          f"shape_mismatches=0, loaded_keys={load_report['loaded_keys']}"
-      )
-      logger.info(f' => ✅ 历史权重接力成功！将从 Epoch {start_epoch} 继续！')
+      from collections import OrderedDict
+
+      new_state_dict = OrderedDict()
+      for k, v in state_dict.items():
+        name = k if k.startswith('module.') else 'module.' + k
+        if any(layer in name for layer in ['distype_cls', 'regression']):
+          current_param = model.state_dict().get(name, None)
+          if current_param is not None and current_param.shape != v.shape:
+            logger.info(f'  [跳过不兼容权重] 层 {name} 形状不匹配，已重置')
+            continue
+        new_state_dict[name] = v
+
+      model.load_state_dict(new_state_dict, strict=False)
+      logger.info(f' =>  历史权重接力成功！将从 Epoch {start_epoch} 继续！')
 
       if 'torch_rng' in checkpoint:
         torch.set_rng_state(checkpoint['torch_rng'].cpu())
@@ -687,14 +602,11 @@ def train_iqa(args):
         np.random.set_state(checkpoint['numpy_rng'])
       if 'python_rng' in checkpoint:
         random.setstate(checkpoint['python_rng'])
-    else:
-      logger.info(f'=> ⚠️ 未找到权重文件，开启从头训练 Scratch！')
   else:
-    logger.info('=> 🚀 从零开始训练 (Scratch)，全新初始化网络...')
+    logger.info('=>  从零开始训练 (Scratch)，全新初始化网络...')
 
   if args.evaluate:
-    logger.info('\n📊 One-time evaluation on the held-out 20% test split...')
-    validate(build_test_loader(), model.cuda(), criterion, dataset_name=args.dataset)
+    validate(val_loader, model.cuda(), criterion, dataset_name=args.dataset)
     return
 
   csv_file_path = os.path.join(
@@ -702,34 +614,29 @@ def train_iqa(args):
       f"metrics_record_{time.strftime('%Y%m%d_%H%M%S')}.csv",
   )
 
-  with open(csv_file_path, mode='w', newline='', encoding='utf-8') as f:
-    writer = csv.writer(f)
-    header = ['Epoch', 'Stage', 'Train_MOS_Loss', 'Evaluation_Mode']
-    if args.eval_every_epoch:
-      header.extend([
-          'Test_SROCC_raw',
-          'Test_PLCC_5param_mapped',
-          'Test_RMSE_5param_mapped',
-          'Diagnostic_Notice',
+  if start_epoch == 0:
+    with open(csv_file_path, mode='w', newline='', encoding='utf-8') as f:
+      writer = csv.writer(f)
+      writer.writerow([
+          'Epoch',
+          'Stage',
+          'Train_MOS_Loss',
+          'Val_SROCC',
+          'Val_PLCC',
+          'Val_RMSE',
+          'Best_SROCC',
+          'Best_PLCC',
       ])
-    writer.writerow(header)
 
   stage2_opt_initialized = False
-  test_srocc = None
-  test_plcc = None
-  test_rmse = None
 
-  # ============================================================
-  # 💎 标准化学术训练主循环
-  # ============================================================
+
   for epoch in range(start_epoch, args.epochs):
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ----------------------------------------------------
-    # 1. 阶段判断与优化器切换逻辑
-    # ----------------------------------------------------
+
     if epoch < stage1_epochs:
       current_stage = 'Stage1'
       apply_stage1_freezing(raw_model)
@@ -770,12 +677,12 @@ def train_iqa(args):
               ]
               migrated_count += 1
           logger.info(
-              f'🔄 [动量继承成功] 已平滑迁移 {migrated_count} 个参数的 Adam'
+              f' [动量继承成功] 已平滑迁移 {migrated_count} 个参数的 Adam'
               ' 历史状态！'
           )
         except Exception as e:
           logger.warning(
-              f'⚠️ 动量迁移跳过 (将以全新状态启动 Stage 2 优化器): {e}'
+              f' 动量迁移跳过 (将以全新状态启动 Stage 2 优化器): {e}'
           )
 
         optimizer = stage2_optimizer
@@ -785,62 +692,62 @@ def train_iqa(args):
 
     logger.info(f'\nEpoch: [{epoch}]\tStage: {current_stage}')
 
-    # ----------------------------------------------------
-    # 2. 前向训练
-    # ----------------------------------------------------
+
     train_loss = train(
         train_loader, model, criterion, optimizer, epoch, scaler
     )
 
-    if args.eval_every_epoch:
-      logger.warning(
-          'DIAGNOSTIC ONLY — test metrics are not used for model selection.'
+    try:
+      logger.info('\n📊 Validating...')
+      srocc, plcc, rmse = validate(
+          val_loader, model.cuda(), criterion, dataset_name=args.dataset
       )
-      test_srocc, test_plcc, test_rmse = validate(
-          build_test_loader(), model.cuda(), criterion, dataset_name=args.dataset
+    except Exception as e:
+      logger.error(
+          f'🚨 [CRITICAL] Validation crashed at epoch {epoch}: {e}. Skipping'
+          ' metrics pass.'
       )
+      continue
+
+
+    is_best = False
+    if srocc > best_srocc:
+      best_srocc = srocc
+      best_plcc = plcc
+      best_rmse = rmse
+      is_best = True
+      no_improve = 0
+    else:
+      no_improve += 1
 
     logger.info('\n' + '=' * 80)
-    logger.info(f'📊 Epoch {epoch} ({current_stage}) 训练完成')
-    logger.info(f'   Train MOS Loss: {train_loss:.6f}')
-    if args.eval_every_epoch:
-      logger.info(f'   Test SROCC (raw prediction): {test_srocc:.6f}')
-      logger.info(
-          f'   Test PLCC (5-parameter logistic mapped): {test_plcc:.6f}'
-      )
-      logger.info(
-          f'   Test RMSE (5-parameter logistic mapped): {test_rmse:.6f}'
-      )
-      logger.warning(
-          '   DIAGNOSTIC ONLY — test metrics are not used for model selection.'
-      )
+    logger.info(f'📊 Epoch {epoch} ({current_stage}) 运行结果:')
+    logger.info(
+        f'   Current SROCC:  {srocc:.6f} | Current PLCC:   {plcc:.6f} | Current'
+        f' RMSE:   {rmse:.6f}'
+    )
+    logger.info(
+        f'    历史最高标准 SROCC: {best_srocc:.6f} (伴随 PLCC: {best_plcc:.6f} |'
+        f' RMSE: {best_rmse:.6f})'
+    )
     logger.info('=' * 80)
 
-    # ----------------------------------------------------
-    # 4. 日志记录与权重保存
-    # ----------------------------------------------------
+
     with open(csv_file_path, mode='a', newline='', encoding='utf-8') as f:
       writer = csv.writer(f)
-      row = [
+      writer.writerow([
           epoch,
           current_stage,
           f'{train_loss:.4f}' if train_loss is not None else '0.0000',
-          'diagnostic' if args.eval_every_epoch else 'formal',
-      ]
-      if args.eval_every_epoch:
-        row.extend([
-            f'{test_srocc:.6f}',
-            f'{test_plcc:.6f}',
-            f'{test_rmse:.6f}',
-            'DIAGNOSTIC ONLY — test metrics are not used for model selection.',
-        ])
-      writer.writerow(row)
+          f'{srocc:.6f}',
+          f'{plcc:.6f}',
+          f'{rmse:.6f}',
+          f'{best_srocc:.6f}',
+          f'{best_plcc:.6f}',
+      ])
 
-    # 统一采用按 split 隔离的绝对路径
-    base_models_dir = args.model_root
-    split_dir = os.path.join(base_models_dir, args.dataset.lower(), f'split_{pro}')
-    os.makedirs(split_dir, exist_ok=True)
-    checkpoint_path = os.path.join(split_dir, 'checkpoint_latest.pkl')
+
+    checkpoint_path = os.path.join(run_save_dir, 'checkpoint_latest.pkl')
 
     save_checkpoint(
         {
@@ -852,114 +759,57 @@ def train_iqa(args):
             'min_loss': best_srocc,
             'best_srocc': best_srocc,
             'best_plcc': best_plcc,
-            'monitor_test_srocc': test_srocc if args.eval_every_epoch else None,
-            'monitor_test_plcc': test_plcc if args.eval_every_epoch else None,
-            'monitor_test_rmse': test_rmse if args.eval_every_epoch else None,
             'torch_rng': torch.get_rng_state(),
             'cuda_rng': torch.cuda.get_rng_state(),
             'numpy_rng': np.random.get_state(),
             'python_rng': random.getstate(),
-            'selection_protocol': (
-                'fixed_epoch_8_2_diagnostic_test_monitoring'
-                if args.eval_every_epoch
-                else 'fixed_epoch_8_2_formal_single_final_test'
-            ),
-            'fixed_epochs': args.epochs,
         },
+        is_best,
         filename=checkpoint_path,
+        pro=args.pro,
+        dataset_name=args.dataset.lower(),
     )
 
-  split_dir = os.path.join(
-      args.model_root, args.dataset.lower(), f'split_{pro}'
-  )
+    if no_improve >= patience:
+      logger.info(
+          f'🛑 [EARLY STOPPING] 连续 {patience} 轮无正面 SROCC 效益提升，终止训练。'
+      )
+      break
+
+
+
+def save_checkpoint(
+    state,
+    is_best,
+    filename='checkpoint_latest.pkl',
+    pro='1',
+    dataset_name='scid',
+    exp_name=None,
+):
+  if exp_name is None:
+    if 'args' in globals() and hasattr(globals()['args'], 'exp_name'):
+      exp_name = globals()['args'].exp_name
+    else:
+      exp_name = 'DFSS_Mamba_Scratch_Experiment'
+
+
+  save_filename = os.path.abspath(os.path.expanduser(filename))
+  split_dir = os.path.dirname(save_filename)
   os.makedirs(split_dir, exist_ok=True)
-  final_checkpoint_path = os.path.join(split_dir, 'model_final.pkl')
-  final_state = {
-      'epoch': args.epochs,
-      'history_base_epoch': args.epochs,
-      'state_dict': model.state_dict(),
-      'optimizer_state_dict': optimizer.state_dict(),
-      'scheduler_state_dict': None,
-      'torch_rng': torch.get_rng_state(),
-      'cuda_rng': torch.cuda.get_rng_state(),
-      'numpy_rng': np.random.get_state(),
-      'python_rng': random.getstate(),
-      'selection_protocol': 'fixed_epoch_no_test_selection',
-      'fixed_epochs': args.epochs,
-  }
-  save_checkpoint(final_state, filename=final_checkpoint_path)
-  compatibility_path = os.path.join(split_dir, 'model_best.pkl')
-  shutil.copyfile(final_checkpoint_path, compatibility_path)
-  logger.warning(
-      f'Compatibility alias saved: {compatibility_path}. It is an exact copy of '
-      'model_final.pkl and does NOT mean test-selected best.'
-  )
 
-  logger.info(f'Creating a fresh inference model and reloading: {final_checkpoint_path}')
-  final_model = nn.DataParallel(build_model(args, istrain=False).cuda())
-  reloaded_checkpoint = load_checkpoint_file(
-      final_checkpoint_path, map_location='cuda'
-  )
-  load_report = strict_load_checkpoint(
-      final_model, reloaded_checkpoint, final_checkpoint_path
-  )
-  logger.info(
-      'Strict checkpoint check: missing_keys=0, unexpected_keys=0, '
-      f"shape_mismatches=0, loaded_keys={load_report['loaded_keys']}"
-  )
+  torch.save(state, save_filename)
+  logger.info(f'💾 checkpoint saved: {save_filename}')
 
-  logger.info('\n' + '=' * 80)
-  logger.info(
-      f'📊 FINAL RELOADED CHECKPOINT TEST: split {pro}, fixed epochs = {args.epochs}'
-  )
-  logger.info('=' * 80)
+  if is_best:
+    best_path = os.path.join(split_dir, 'model_best.pkl')
+    torch.save(state, best_path)
+    logger.info(f'🏆 best model saved: {best_path}')
 
-  result_timestamp = time.strftime('%Y%m%d_%H%M%S')
-  test_csv_path = os.path.join(
-      os.path.dirname(log_file_path),
-      f"final_test_{args.dataset.lower()}_split_{pro}_"
-      f'{result_timestamp}.csv',
-  )
-  prediction_csv_path = os.path.join(
-      os.path.dirname(log_file_path),
-      f'predictions_{args.dataset.lower()}_split_{pro}_{result_timestamp}.csv',
-  )
-  test_srocc, test_plcc, test_rmse = validate(
-      build_test_loader(),
-      final_model,
-      criterion,
-      dataset_name=args.dataset,
-      prediction_csv_path=prediction_csv_path,
-      split=pro,
-  )
-  with open(test_csv_path, mode='w', newline='', encoding='utf-8') as f:
-    writer = csv.writer(f)
-    writer.writerow([
-        'Split',
-        'Fixed_Epochs',
-        'Test_SROCC_raw_prediction',
-        'Test_PLCC_5param_logistic_mapped',
-        'Test_RMSE_5param_logistic_mapped',
-        'Checkpoint_Path',
-    ])
-    writer.writerow([
-        pro,
-        args.epochs,
-        f'{test_srocc:.6f}',
-        f'{test_plcc:.6f}',
-        f'{test_rmse:.6f}',
-        final_checkpoint_path,
-    ])
-  logger.info(f'✅ Final test result saved to: {test_csv_path}')
-
-
-# ============================================================
-# 💾 保存逻辑重构：按 Split 隔离保存，自动按 Scratch 命名标识
-# ============================================================
-def save_checkpoint(state, filename='checkpoint_latest.pkl'):
-  os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
-  torch.save(state, filename)
-  logger.info(f'💾 checkpoint saved: {filename}')
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_filename = f'{dataset_name.upper()}_{exp_name}_best_{timestamp}.pkl'
+    backup_path = os.path.join(split_dir, backup_filename)
+    shutil.copyfile(best_path, backup_path)
+    logger.info(f'📦 自动标识备份最佳模型至: {backup_path}')
 
 
 def parse_args():
@@ -986,7 +836,7 @@ def parse_args():
     )
     default_dtype = 9
     default_resume = os.path.join(
-        release_root_dir, 'models_fixed_8_2/scid/checkpoint_latest.pkl'
+        release_root_dir, 'models/scid/checkpoint_latest.pkl'
     )
   else:
     default_list_dir = os.path.join(
@@ -994,7 +844,7 @@ def parse_args():
     )
     default_dtype = 7
     default_resume = os.path.join(
-        release_root_dir, 'models_fixed_8_2/siqad/checkpoint_latest.pkl'
+        release_root_dir, 'models/siqad/checkpoint_latest.pkl'
     )
 
   global log_file_path
@@ -1002,20 +852,15 @@ def parse_args():
 
   logger.info('=' * 60)
   logger.info(
-      f'🚀 智能数据集路由成功! 当前目标数据集: {current_dataset} (Scratch Mode)'
+      f'当前目标数据集: {current_dataset} (Scratch Mode)'
   )
-  logger.info(f'   🎯 数据目录: {default_data_dir}')
-  logger.info(f'   📜 脚本目录: {default_list_dir}')
-  logger.info(f'   🏷️ 分类头数: {default_dtype} | 📂 默认权重: {default_resume}')
+  logger.info(f'   数据目录: {default_data_dir}')
+  logger.info(f'   脚本目录: {default_list_dir}')
+  logger.info(f'   分类头数: {default_dtype} | 默认权重: {default_resume}')
   logger.info('=' * 60)
 
   parser.add_argument('-d', '--data-dir', default=default_data_dir)
   parser.add_argument('-l', '--list-dir', default=default_list_dir)
-  parser.add_argument(
-      '--model-root',
-      default=os.path.join(release_root_dir, 'models_fixed_8_2'),
-      help='Root directory containing <dataset>/split_N checkpoints.',
-  )
   parser.add_argument('-n', '--n-ptchs-per-img', type=int, default=32)
   parser.add_argument('-nd', '--n-dtype', type=int, default=default_dtype)
 
@@ -1034,21 +879,29 @@ def parse_args():
   parser.add_argument('--stage1_epochs', type=int, default=15)
   parser.add_argument('--lr', type=float, default=1e-4)
   parser.add_argument('--weight-decay', default=1e-4, type=float)
-  parser.add_argument('--resume', default=default_resume, type=str)
+  parser.add_argument(
+      '--resume',
+      default=None,
+      type=str,
+      help=(
+          '要续训的 checkpoint 完整路径；指定后优先于默认 split '
+          '断点'
+      ),
+  )
+  parser.add_argument(
+      '--save-dir',
+      default=None,
+      type=str,
+      help=(
+          '本次运行的 checkpoint 保存目录。未指定时，显式续训将'
+          '保存到 --resume 文件所在目录'
+      ),
+  )
 
   parser.add_argument('--pro', type=int, default=1)
   parser.add_argument('--workers', type=int, default=6)
   parser.add_argument('--subset', default='test')
   parser.add_argument('--evaluate', dest='evaluate', action='store_true')
-  parser.add_argument(
-      '--eval_every_epoch',
-      action='store_true',
-      default=False,
-      help=(
-          'DIAGNOSTIC ONLY: evaluate test_N after every epoch. Test metrics '
-          'are never used for checkpoint selection or early stopping.'
-      ),
-  )
   parser.add_argument('--weighted', default=True, action='store_true')
   parser.add_argument('--dump_per', type=int, default=50)
 
@@ -1062,10 +915,5 @@ def parse_args():
 
 def main():
   args = parse_args()
-  if args.cmd == 'test':
-    args.evaluate = True
-  train_iqa(args)
-
-
-if __name__ == '__main__':
-  main()
+  if args.cmd == 'train':
+    train_iqa(args)
